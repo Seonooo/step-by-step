@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  # =============================================
+  # Redis Master
+  # =============================================
+  redis-master:
+    image: redis:7.0
+    container_name: redis-master
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --slowlog-log-slower-than 10000
+    volumes:
+      - redis-master-data:/data
+    networks:
+      - redis-network
+
+  # =============================================
+  # Redis Replica 1
+  # =============================================
+  redis-replica-1:
+    image: redis:7.0
+    container_name: redis-replica-1
+    ports:
+      - "6380:6379"
+    command: >
+      redis-server
+      --replicaof redis-master 6379
+      --appendonly yes
+    volumes:
+      - redis-replica1-data:/data
+    depends_on:
+      - redis-master
+    networks:
+      - redis-network
+
+  # =============================================
+  # Redis Replica 2
+  # =============================================
+  redis-replica-2:
+    image: redis:7.0
+    container_name: redis-replica-2
+    ports:
+      - "6381:6379"
+    command: >
+      redis-server
+      --replicaof redis-master 6379
+      --appendonly yes
+    volumes:
+      - redis-replica2-data:/data
+    depends_on:
+      - redis-master
+    networks:
+      - redis-network
+
+  # =============================================
+  # Redis Sentinel 1
+  # =============================================
+  redis-sentinel-1:
+    image: redis:7.0
+    container_name: redis-sentinel-1
+    ports:
+      - "26379:26379"
+    command: >
+      redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./sentinel1.conf:/etc/redis/sentinel.conf
+    depends_on:
+      - redis-master
+      - redis-replica-1
+      - redis-replica-2
+    networks:
+      - redis-network
+
+  # =============================================
+  # Redis Sentinel 2
+  # =============================================
+  redis-sentinel-2:
+    image: redis:7.0
+    container_name: redis-sentinel-2
+    ports:
+      - "26380:26379"
+    command: >
+      redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./sentinel2.conf:/etc/redis/sentinel.conf
+    depends_on:
+      - redis-master
+      - redis-replica-1
+      - redis-replica-2
+    networks:
+      - redis-network
+
+  # =============================================
+  # Redis Sentinel 3
+  # =============================================
+  redis-sentinel-3:
+    image: redis:7.0
+    container_name: redis-sentinel-3
+    ports:
+      - "26381:26379"
+    command: >
+      redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./sentinel3.conf:/etc/redis/sentinel.conf
+    depends_on:
+      - redis-master
+      - redis-replica-1
+      - redis-replica-2
+    networks:
+      - redis-network
+
+networks:
+  redis-network:
+    driver: bridge
+
+volumes:
+  redis-master-data:
+  redis-replica1-data:
+  redis-replica2-data:
