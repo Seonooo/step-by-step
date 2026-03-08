@@ -1,29 +1,39 @@
 package com.redislab;
 
+import io.lettuce.core.LettuceFutures;
 import io.lettuce.core.RedisClient;
+import io.lettuce.core.RedisFuture;
 import io.lettuce.core.RedisURI;
 import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.api.async.RedisAsyncCommands;
 import io.lettuce.core.api.sync.RedisCommands;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Step 2 — 복제 지연(Replication Lag) 실습
- *
+ * <p>
  * 목표:
- *   1. Master 쓰기 직후 Replica에서 읽으면 이전 값이 반환됨을 확인
- *   2. 지연 시간별(즉시/1ms/5ms/10ms) 복제 전파 속도 측정
- *   3. 연속 대량 쓰기 시 누적 지연 확인
- *   4. WAIT 명령으로 동기 복제 보장 방법 확인
- *   5. Read-Your-Own-Writes 문제 재현 및 해결
- *
+ * 1. Master 쓰기 직후 Replica에서 읽으면 이전 값이 반환됨을 확인
+ * 2. 지연 시간별(즉시/1ms/5ms/10ms) 복제 전파 속도 측정
+ * 3. 연속 대량 쓰기 시 누적 지연 확인
+ * 4. WAIT 명령으로 동기 복제 보장 방법 확인
+ * 5. Read-Your-Own-Writes 문제 재현 및 해결
+ * <p>
  * 사전 조건:
- *   step1-setup/ 에서 docker compose up -d
+ * step1-setup/ 에서 docker compose up -d
  */
 public class ReplicationLag {
 
-    private static final String MASTER_HOST  = "localhost";
-    private static final int    MASTER_PORT  = 6379;
+    private static final String MASTER_HOST = "localhost";
+    private static final int MASTER_PORT = 6379;
     private static final String REPLICA_HOST = "localhost";
-    private static final int    REPLICA_PORT = 6380;
+    private static final int REPLICA_PORT = 6380;
+
+    private static final int FLOOD_COUNT = 100_000;
+    private static final String FLOOD_VALUE = "X".repeat(100); // 100 bytes per value
 
     // =============================================
     // 실습 1: 기본 복제 지연 확인
@@ -145,7 +155,7 @@ public class ReplicationLag {
         System.out.printf("  Master SET  %s = COMPLETED%n", key);
 
         long waitStart = System.currentTimeMillis();
-        Long replicasAck = master.wait(1L, 100L);
+        Long replicasAck = master.waitForReplication(1, 100L);
         long waitElapsed = System.currentTimeMillis() - waitStart;
 
         System.out.printf("  WAIT 1 100 결과: %d개 Replica 복제 완료 (소요: %dms)%n",
@@ -219,11 +229,154 @@ public class ReplicationLag {
         System.out.println("[WAIT 방식 적용]");
         master.set(key, "NewNickname_v2");
         System.out.printf("  WRITE  → Master: SET %s = NewNickname_v2%n", key);
-        master.wait(1L, 100L);
+        master.waitForReplication(1, 100L);
         System.out.println("  WAIT 1 100 완료 (복제 보장)");
         String readAfterWait = replica.get(key);
         System.out.printf("  READ   → Replica: GET %s = %s  %s%n",
                 key, readAfterWait, staleOrFresh(readAfterWait, "NewNickname_v2"));
+    }
+
+    // =============================================
+    // 실습 6: 비동기 파이프라인 대량 쓰기 → 복제 버퍼 적체
+    //   - Lettuce async API로 10만 건 한꺼번에 폭격
+    //   - Master vs Replica offset 차이를 실시간 모니터링
+    //   - 쓰기 폭발 중 Replica 읽기 → stale 값 관찰
+    // =============================================
+    static void lab6_pipelineFloodLag(
+            StatefulRedisConnection<String, String> masterConn,
+            RedisCommands<String, String> replica) throws Exception {
+
+        printHeader("실습 6: 비동기 파이프라인 버퍼 적체 유발");
+
+        RedisCommands<String, String> master = masterConn.sync();
+        RedisAsyncCommands<String, String> async = masterConn.async();
+
+        String probeKey = "flood:probe";
+        master.set(probeKey, "BEFORE_FLOOD");
+        Thread.sleep(100);
+        System.out.println("초기 probe 값 → Replica: " + replica.get(probeKey));
+        System.out.printf("%n[%,d건 × %d bytes 비동기 쓰기 시작]%n", FLOOD_COUNT, FLOOD_VALUE.length());
+
+        async.setAutoFlushCommands(false);
+        List<RedisFuture<String>> futures = new ArrayList<>(FLOOD_COUNT + 1);
+
+        long writeStart = System.currentTimeMillis();
+        for (int i = 0; i < FLOOD_COUNT; i++) {
+            futures.add(async.set("flood:" + i, FLOOD_VALUE + i));
+            if ((i + 1) % 1000 == 0) {
+                async.flushCommands();
+            }
+        }
+        futures.add(async.set(probeKey, "AFTER_FLOOD"));
+        async.flushCommands();
+        async.setAutoFlushCommands(true);
+
+        long writeElapsed = System.currentTimeMillis() - writeStart;
+        System.out.printf("쓰기 명령 전송 완료 (소요: %dms)%n%n", writeElapsed);
+
+        System.out.printf("%-10s  %-16s  %-16s  %-10s  %s%n",
+                "경과(ms)", "Master offset", "Replica offset", "Gap(bytes)", "Replica probe");
+        System.out.println("-".repeat(75));
+
+        long monStart = System.currentTimeMillis();
+        for (int i = 0; i < 30; i++) {
+            long mOffset = parseOffset(master.info("replication"), "master_repl_offset");
+            long rOffset = parseOffset(replica.info("replication"), "slave_repl_offset");
+            long gap = mOffset - rOffset;
+            String probe = replica.get(probeKey);
+            long elapsed = System.currentTimeMillis() - monStart;
+
+            System.out.printf("%-10d  %-16d  %-16d  %-10d  %s%n",
+                    elapsed, mOffset, rOffset, gap,
+                    "AFTER_FLOOD".equals(probe) ? "← 최신값 ✓" : "← 이전값! (복제 지연 중)");
+
+            if (gap == 0 && "AFTER_FLOOD".equals(probe)) {
+                System.out.println("\n→ Replica가 Master를 완전히 따라잡았습니다.");
+                break;
+            }
+            Thread.sleep(100);
+        }
+
+        LettuceFutures.awaitAll(10, TimeUnit.SECONDS, futures.toArray(new RedisFuture[0]));
+        System.out.println("\n→ 총 " + FLOOD_COUNT + "건 쓰기 완료 확인.");
+    }
+
+    // =============================================
+    // 실습 7: Docker Pause로 강제 복제 지연 재현
+    //   - redis-replica-1 일시 정지 → Master에 대량 쓰기
+    //   - Replica 재개 후 따라잡기(catch-up) 과정 관찰
+    //   - 정지 중 / 재개 직후 stale 값 확인
+    // =============================================
+    static void lab7_pauseReplicaLag(
+            StatefulRedisConnection<String, String> masterConn,
+            RedisCommands<String, String> replica) throws Exception {
+
+        printHeader("실습 7: Docker Pause → 강제 복제 지연 재현");
+
+        RedisCommands<String, String> master = masterConn.sync();
+        RedisAsyncCommands<String, String> async = masterConn.async();
+
+        String probeKey = "pause:probe";
+        int writesWhilePaused = 20_000;
+
+        master.set(probeKey, "BEFORE_PAUSE");
+        Thread.sleep(100);
+        System.out.println("초기값 설정: " + probeKey + " = BEFORE_PAUSE");
+        System.out.println("Replica 확인: " + replica.get(probeKey));
+
+        System.out.println("\n[1단계] redis-replica-1 Pause (복제 수신 중단)");
+        runCommand("docker", "pause", "redis-replica-1");
+        System.out.println("  → Replica 일시 정지됨");
+
+        try {
+            System.out.printf("\n[2단계] Replica 정지 중 Master에 %,d건 비동기 쓰기%n", writesWhilePaused);
+            async.setAutoFlushCommands(false);
+            List<RedisFuture<String>> futures = new ArrayList<>(writesWhilePaused + 1);
+
+            long writeStart = System.currentTimeMillis();
+            for (int i = 0; i < writesWhilePaused; i++) {
+                futures.add(async.set("paused:key:" + i, FLOOD_VALUE + i));
+                if ((i + 1) % 1000 == 0) async.flushCommands();
+            }
+            futures.add(async.set(probeKey, "AFTER_PAUSE_WRITES"));
+            async.flushCommands();
+            async.setAutoFlushCommands(true);
+
+            LettuceFutures.awaitAll(10, TimeUnit.SECONDS, futures.toArray(new RedisFuture[0]));
+            long writeElapsed = System.currentTimeMillis() - writeStart;
+
+            long masterOffset = parseOffset(master.info("replication"), "master_repl_offset");
+            System.out.printf("  쓰기 완료: %dms / Master offset: %d%n", writeElapsed, masterOffset);
+            System.out.println("  Replica probe (정지 중): [읽기 불가 - 컨테이너 paused]");
+
+        } finally {
+            System.out.println("\n[3단계] redis-replica-1 Unpause (복제 재개 → catch-up 시작)");
+            runCommand("docker", "unpause", "redis-replica-1");
+            System.out.println("  → Replica 재개됨\n");
+        }
+
+        System.out.printf("%-10s  %-16s  %-16s  %-10s  %s%n",
+                "경과(ms)", "Master offset", "Replica offset", "Gap(bytes)", "Replica probe");
+        System.out.println("-".repeat(75));
+
+        long monStart = System.currentTimeMillis();
+        for (int i = 0; i < 60; i++) {
+            long mOffset = parseOffset(master.info("replication"), "master_repl_offset");
+            long rOffset = parseOffset(replica.info("replication"), "slave_repl_offset");
+            long gap = mOffset - rOffset;
+            String probe = replica.get(probeKey);
+            long elapsed = System.currentTimeMillis() - monStart;
+
+            System.out.printf("%-10d  %-16d  %-16d  %-10d  %s%n",
+                    elapsed, mOffset, rOffset, gap,
+                    "AFTER_PAUSE_WRITES".equals(probe) ? "← 최신값 ✓" : "← 이전값! (따라잡는 중)");
+
+            if (gap == 0 && "AFTER_PAUSE_WRITES".equals(probe)) {
+                System.out.printf("\n→ catch-up 완료! (%dms 소요)%n", elapsed);
+                break;
+            }
+            Thread.sleep(50);
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -235,14 +388,14 @@ public class ReplicationLag {
         System.out.println("Docker  : step1-setup/ 에서 docker compose up -d");
         System.out.println("=".repeat(60));
 
-        RedisClient masterClient  = RedisClient.create(RedisURI.create(MASTER_HOST, MASTER_PORT));
+        RedisClient masterClient = RedisClient.create(RedisURI.create(MASTER_HOST, MASTER_PORT));
         RedisClient replicaClient = RedisClient.create(RedisURI.create(REPLICA_HOST, REPLICA_PORT));
 
         try (
-            StatefulRedisConnection<String, String> masterConn  = masterClient.connect();
-            StatefulRedisConnection<String, String> replicaConn = replicaClient.connect()
+                StatefulRedisConnection<String, String> masterConn = masterClient.connect();
+                StatefulRedisConnection<String, String> replicaConn = replicaClient.connect()
         ) {
-            RedisCommands<String, String> master  = masterConn.sync();
+            RedisCommands<String, String> master = masterConn.sync();
             RedisCommands<String, String> replica = replicaConn.sync();
 
             lab1_basicReplicationLag(master, replica);
@@ -250,6 +403,8 @@ public class ReplicationLag {
             lab3_waitSyncReplication(master, replica);
             lab4_replicationInfo(master, replica);
             lab5_readYourOwnWrites(master, replica);
+            lab6_pipelineFloodLag(masterConn, replica);
+            lab7_pauseReplicaLag(masterConn, replica);
 
             printHeader("실습 완료");
             System.out.println("핵심: 금융 데이터는 Master 읽기 / 캐시·세션은 Replica 읽기");
@@ -264,6 +419,24 @@ public class ReplicationLag {
         java.time.LocalTime t = java.time.LocalTime.now();
         return String.format("%02d:%02d:%02d.%03d",
                 t.getHour(), t.getMinute(), t.getSecond(), t.getNano() / 1_000_000);
+    }
+
+    private static long parseOffset(String info, String key) {
+        for (String line : info.split("\r?\n")) {
+            if (line.startsWith(key + ":")) {
+                try {
+                    return Long.parseLong(line.split(":")[1].trim());
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return -1;
+    }
+
+    private static void runCommand(String... cmd) throws Exception {
+        Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+        int exit = p.waitFor();
+        if (exit != 0) throw new RuntimeException("Command failed (exit " + exit + "): " + String.join(" ", cmd));
     }
 
     private static String staleOrFresh(String actual, String expected) {
